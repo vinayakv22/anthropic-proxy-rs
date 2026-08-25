@@ -68,6 +68,10 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
                             reasoning_parts.push(thinking);
                         }
                     }
+                    anthropic::ContentBlock::RedactedThinking { .. } => {
+                        // The payload is encrypted for Anthropic and has no meaning to
+                        // an OpenAI-compatible model. Accept it so resumes work, then omit it.
+                    }
                 }
             }
 
@@ -441,6 +445,27 @@ mod tests {
         assert!(matches!(
             &translated[0].content,
             Some(openai::MessageContent::Text(text)) if text == "first second"
+        ));
+    }
+
+    #[test]
+    fn redacted_thinking_is_accepted_and_omitted() {
+        let msg: anthropic::Message = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "redacted_thinking", "data": "opaque-encrypted-payload"},
+                {"type": "text", "text": "visible answer"}
+            ]
+        }))
+        .unwrap();
+
+        let translated = translate_message(msg).unwrap();
+
+        assert_eq!(translated.len(), 1);
+        assert!(translated[0].reasoning_content.is_none());
+        assert!(matches!(
+            &translated[0].content,
+            Some(openai::MessageContent::Text(text)) if text == "visible answer"
         ));
     }
 

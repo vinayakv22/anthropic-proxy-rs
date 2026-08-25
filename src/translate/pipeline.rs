@@ -368,6 +368,7 @@ fn collect_content_text(content: &anthropic::MessageContent, parts: &mut Vec<Str
                 match block {
                     anthropic::ContentBlock::Text { text, .. } => parts.push(text.clone()),
                     anthropic::ContentBlock::Thinking { thinking } => parts.push(thinking.clone()),
+                    anthropic::ContentBlock::RedactedThinking { .. } => {}
                     anthropic::ContentBlock::ToolUse { name, input, .. } => {
                         parts.push(name.clone());
                         parts.push(input.to_string());
@@ -424,6 +425,7 @@ fn estimate_block_tokens(block: &anthropic::ContentBlock) -> usize {
     match block {
         anthropic::ContentBlock::Text { text, .. } => estimate_text_tokens(text),
         anthropic::ContentBlock::Thinking { thinking } => estimate_text_tokens(thinking),
+        anthropic::ContentBlock::RedactedThinking { .. } => 0,
         anthropic::ContentBlock::ToolUse { name, input, .. } => {
             estimate_text_tokens(name) + estimate_text_tokens(&input.to_string())
         }

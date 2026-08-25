@@ -101,6 +101,11 @@ pub enum ContentBlock {
     },
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
+    /// Claude Code persists opaque encrypted thinking from earlier turns using
+    /// this Anthropic-native block. It must deserialize on resumed sessions, but
+    /// cannot be translated into reasoning text for a non-Anthropic upstream.
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
 }
 
 /// Content inside a tool_result block: either a plain string or nested content blocks
