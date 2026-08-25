@@ -613,6 +613,54 @@ async fn send_request(
     }
 }
 
+/// Some OpenAI-compatible gateways accept multipart message content at their public
+/// edge but route individual models through a stricter Chat Completions parser.  When
+/// that parser identifies a specific rejected `messages[N].content`, collapse only
+/// that message to text for a single compatibility retry.  Text parts are preserved;
+/// images get an explicit placeholder instead of silently disappearing.
+fn canonicalize_rejected_message_content(messages: &mut [openai::Message], error: &str) -> bool {
+    let Some(index) = parse_rejected_message_index(error) else {
+        return false;
+    };
+    let Some(message) = messages.get_mut(index) else {
+        return false;
+    };
+
+    match message.content.take() {
+        Some(openai::MessageContent::Parts(parts)) => {
+            let text = parts
+                .into_iter()
+                .map(|part| match part {
+                    openai::ContentPart::Text { text } => text,
+                    openai::ContentPart::ImageUrl { .. } => {
+                        "[Image omitted: upstream rejected multipart message content]".to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            message.content = Some(openai::MessageContent::Text(text));
+            true
+        }
+        None => {
+            // OpenAI permits null content on assistant tool-call messages, but some
+            // Responses-backed providers require a string even when tool_calls exists.
+            message.content = Some(openai::MessageContent::Text(String::new()));
+            true
+        }
+        content @ Some(openai::MessageContent::Text(_)) => {
+            message.content = content;
+            false
+        }
+    }
+}
+
+fn parse_rejected_message_index(error: &str) -> Option<usize> {
+    let rest = error.split_once("messages[")?.1;
+    let (index, suffix) = rest.split_once(']')?;
+    suffix.starts_with(".content").then_some(())?;
+    index.parse().ok()
+}
+
 async fn handle_non_streaming(
     config: Arc<Config>,
     client: Client,
@@ -622,6 +670,7 @@ async fn handle_non_streaming(
     let urls = config.chat_completions_urls();
     let mut last_err = None;
     let mut clamp_attempts = 0u32;
+    let mut content_compat_attempted = false;
 
     for url in &urls {
         for attempt in 1..=MAX_ATTEMPTS {
@@ -660,6 +709,16 @@ async fn handle_non_streaming(
                     retriable,
                 } => {
                     metrics::upstream_error("chat_completions");
+                    if status.as_u16() == 422
+                        && !content_compat_attempted
+                        && canonicalize_rejected_message_content(&mut openai_req.messages, &message)
+                    {
+                        tracing::warn!(
+                            "upstream {url} rejected multipart message content; canonicalizing the identified message and retrying once"
+                        );
+                        content_compat_attempted = true;
+                        continue;
+                    }
                     // Self-heal a context-length overflow once: clamp max_tokens so
                     // input + output fits the window, then retry. This unblocks the
                     // deadlock where even /compact can't run because it requests output.
@@ -773,6 +832,7 @@ async fn handle_streaming(
     let urls = config.chat_completions_urls();
     let mut last_err = None;
     let mut clamp_attempts = 0u32;
+    let mut content_compat_attempted = false;
 
     // Only the connection handshake is retried; once bytes start streaming we are
     // committed (events may already have reached the client).
@@ -813,6 +873,16 @@ async fn handle_streaming(
                     retriable,
                 } => {
                     metrics::upstream_error("chat_completions");
+                    if status.as_u16() == 422
+                        && !content_compat_attempted
+                        && canonicalize_rejected_message_content(&mut openai_req.messages, &message)
+                    {
+                        tracing::warn!(
+                            "upstream {url} rejected multipart message content; canonicalizing the identified message and retrying once"
+                        );
+                        content_compat_attempted = true;
+                        continue;
+                    }
                     // Self-heal a context-length overflow once: clamp max_tokens so
                     // input + output fits the window, then retry. This unblocks the
                     // deadlock where even /compact can't run because it requests output.
@@ -1002,7 +1072,7 @@ fn create_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::{create_sse_stream, request_fields_summary};
-    use crate::models::anthropic;
+    use crate::models::{anthropic, openai};
     use bytes::Bytes;
     use futures::stream::{self, StreamExt};
     use serde_json::{json, Value};
@@ -1189,6 +1259,66 @@ mod tests {
             super::upstream_message("plain text error"),
             "plain text error"
         );
+    }
+
+    #[test]
+    fn canonicalizes_only_the_message_named_by_a_content_422() {
+        let mut messages = vec![
+            openai::Message {
+                role: "user".to_string(),
+                content: Some(openai::MessageContent::Text("keep me".to_string())),
+                ..Default::default()
+            },
+            openai::Message {
+                role: "user".to_string(),
+                content: Some(openai::MessageContent::Parts(vec![
+                    openai::ContentPart::Text {
+                        text: "before".to_string(),
+                    },
+                    openai::ContentPart::ImageUrl {
+                        image_url: openai::ImageUrl {
+                            url: "data:image/png;base64,abc".to_string(),
+                        },
+                    },
+                    openai::ContentPart::Text {
+                        text: "after".to_string(),
+                    },
+                ])),
+                ..Default::default()
+            },
+        ];
+
+        assert!(super::canonicalize_rejected_message_content(
+            &mut messages,
+            "messages[1].content: data did not match any variant"
+        ));
+        assert!(matches!(
+            &messages[0].content,
+            Some(openai::MessageContent::Text(text)) if text == "keep me"
+        ));
+        assert!(matches!(
+            &messages[1].content,
+            Some(openai::MessageContent::Text(text))
+                if text == "before\n[Image omitted: upstream rejected multipart message content]\nafter"
+        ));
+    }
+
+    #[test]
+    fn content_compatibility_retry_ignores_unrelated_422s() {
+        let mut messages = vec![openai::Message {
+            role: "user".to_string(),
+            content: Some(openai::MessageContent::Text("unchanged".to_string())),
+            ..Default::default()
+        }];
+
+        assert!(!super::canonicalize_rejected_message_content(
+            &mut messages,
+            "tools[0].function.parameters is invalid"
+        ));
+        assert!(!super::canonicalize_rejected_message_content(
+            &mut messages,
+            "messages[99].content is invalid"
+        ));
     }
 
     #[tokio::test]
