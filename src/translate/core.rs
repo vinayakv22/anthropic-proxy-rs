@@ -72,16 +72,23 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
             }
 
             if !content_parts.is_empty() || !tool_calls.is_empty() || !reasoning_parts.is_empty() {
-                let content = if content_parts.len() == 1 {
-                    // A lone text part collapses to a plain string; otherwise keep the parts array.
-                    match content_parts.pop().expect("len checked above") {
-                        openai::ContentPart::Text { text } => {
-                            Some(openai::MessageContent::Text(text))
-                        }
-                        other => Some(openai::MessageContent::Parts(vec![other])),
-                    }
-                } else if content_parts.is_empty() {
+                let content = if content_parts.is_empty() {
                     None
+                } else if content_parts
+                    .iter()
+                    .all(|part| matches!(part, openai::ContentPart::Text { .. }))
+                {
+                    // Multiple Anthropic text blocks are still plain text semantically.
+                    // Flatten them losslessly because some OpenAI-compatible providers
+                    // reject the array form even though it is valid Chat Completions JSON.
+                    let text = content_parts
+                        .into_iter()
+                        .map(|part| match part {
+                            openai::ContentPart::Text { text } => text,
+                            openai::ContentPart::ImageUrl { .. } => unreachable!("checked above"),
+                        })
+                        .collect::<String>();
+                    Some(openai::MessageContent::Text(text))
                 } else {
                     Some(openai::MessageContent::Parts(content_parts))
                 };
@@ -411,6 +418,30 @@ mod tests {
             translated[0].reasoning_content.as_deref(),
             Some("hidden chain")
         );
+    }
+
+    #[test]
+    fn multiple_text_blocks_collapse_to_a_plain_string() {
+        let msg = anthropic::Message {
+            role: "user".to_string(),
+            content: anthropic::MessageContent::Blocks(vec![
+                anthropic::ContentBlock::Text {
+                    text: "first".to_string(),
+                    cache_control: None,
+                },
+                anthropic::ContentBlock::Text {
+                    text: " second".to_string(),
+                    cache_control: None,
+                },
+            ]),
+        };
+
+        let translated = translate_message(msg).unwrap();
+
+        assert!(matches!(
+            &translated[0].content,
+            Some(openai::MessageContent::Text(text)) if text == "first second"
+        ));
     }
 
     #[test]
