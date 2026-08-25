@@ -19,6 +19,7 @@ pub fn translate_request(
 ) -> ProxyResult<openai::OpenAIRequest> {
     let model = select_model(&req, policy);
     let reasoning_effort = resolve_effort(&req, &policy.effort_map);
+    let response_format = resolve_response_format(&req);
 
     let mut openai_messages = Vec::new();
 
@@ -92,7 +93,43 @@ pub fn translate_request(
         parallel_tool_calls,
         user,
         reasoning_effort,
+        response_format,
     })
+}
+
+/// Translate Anthropic's structured-output configuration to the OpenAI Chat
+/// Completions `response_format` shape.
+///
+/// Claude Code sends JSON Schema as:
+/// `output_config.format = {"type":"json_schema","schema":{...}}`, while
+/// Chat Completions nests the schema under a named `json_schema` object. Unknown
+/// format types are omitted so an older or stricter upstream is not sent an
+/// invalid parameter.
+fn resolve_response_format(req: &anthropic::AnthropicRequest) -> Option<Value> {
+    let format = req.extra.get("output_config")?.get("format")?.as_object()?;
+    let format_type = format.get("type")?.as_str()?;
+
+    match format_type {
+        "json_schema" => {
+            let schema = Value::Object(format.get("schema")?.as_object()?.clone());
+            let mut json_schema = serde_json::Map::from_iter([
+                ("name".to_string(), Value::String("response".to_string())),
+                ("strict".to_string(), Value::Bool(true)),
+                ("schema".to_string(), schema),
+            ]);
+            if let Some(description) = format.get("description").and_then(Value::as_str) {
+                json_schema.insert(
+                    "description".to_string(),
+                    Value::String(description.to_string()),
+                );
+            }
+            Some(json!({
+                "type": "json_schema",
+                "json_schema": Value::Object(json_schema)
+            }))
+        }
+        _ => None,
+    }
 }
 
 /// Derive the upstream `reasoning_effort` from an Anthropic request:
@@ -488,6 +525,27 @@ mod tests {
 
     fn default_policy() -> TranslationPolicy {
         policy_from(&Config::default())
+    }
+
+    fn request_with_extra(extra: Value) -> anthropic::AnthropicRequest {
+        anthropic::AnthropicRequest {
+            model: "gpt-5.6-terra".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            extra,
+        }
     }
 
     #[test]
@@ -1000,6 +1058,62 @@ mod tests {
                 .reasoning_effort,
             Some("xhigh".to_string())
         );
+    }
+
+    #[test]
+    fn json_schema_output_format_and_effort_are_forwarded() {
+        let req = request_with_extra(json!({
+            "output_config": {
+                "effort": "high",
+                "format": {
+                    "type": "json_schema",
+                    "description": "A short session title",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                        "required": ["title"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }));
+
+        let openai = translate_request(req, &default_policy()).unwrap();
+        assert_eq!(openai.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            openai.response_format,
+            Some(json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response",
+                    "description": "A short session title",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                        "required": ["title"],
+                        "additionalProperties": false
+                    }
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn invalid_or_unknown_output_formats_are_omitted() {
+        for format in [
+            json!({"type": "json_schema"}),
+            json!({"type": "json_schema", "schema": "not-an-object"}),
+            json!({"type": "future_format", "schema": {}}),
+        ] {
+            let req = request_with_extra(json!({"output_config": {"format": format}}));
+            assert_eq!(
+                translate_request(req, &default_policy())
+                    .unwrap()
+                    .response_format,
+                None
+            );
+        }
     }
 
     #[test]

@@ -41,6 +41,10 @@ pub struct OpenAIRequest {
     /// gateway) interprets it; unknown levels are the upstream's concern, not ours.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// OpenAI Chat Completions structured-output configuration, translated from
+    /// Anthropic's `output_config.format`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -303,6 +303,7 @@ To spread searches across multiple source IPs and avoid single-IP rate-limiting,
 ✅ `tool_choice` — `auto` / `any` / `tool` / `none`, incl. `disable_parallel_tool_use`
 ✅ Streaming responses (SSE; handles `\n\n` and `\r\n\r\n` framing)
 ✅ Extended thinking (automatic model routing; `reasoning_content` preserved in both streaming and non-streaming)
+✅ Structured outputs — Anthropic `output_config.format` JSON Schema is translated to OpenAI `response_format`
 ✅ Server-side `web_search` / `web_fetch` emulation (runs the loop against a bundled open-websearch; faithful `server_tool_use` + `*_tool_result` blocks; streaming + non-streaming; SSE heartbeats) — see [Web search & fetch](#web-search--fetch)
 ✅ `metadata.user_id` (forwarded as OpenAI `user`)
 ✅ `refusal` stop reason (mapped from upstream `content_filter`)
